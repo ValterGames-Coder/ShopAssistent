@@ -1,0 +1,137 @@
+name: shop-assistant
+
+x-settings: &settings
+  PGHOST: db
+  PGDATABASE: shop
+  PGUSER: shop
+  PGPASSWORD: ${POSTGRES_PASSWORD:-shop_local_demo}
+  OLLAMA_BASE_URL: http://ollama:11434
+  CHAT_MODEL: ${CHAT_MODEL:-qwen3:4b}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma}
+  MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-180}
+  RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-6}
+  RETRIEVAL_MIN_SCORE: ${RETRIEVAL_MIN_SCORE:-0.30}
+  MAX_QUESTION_LENGTH: ${MAX_QUESTION_LENGTH:-1500}
+  USER_COOLDOWN_SECONDS: ${USER_COOLDOWN_SECONDS:-3}
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  init: true
+  environment: *settings
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shop_local_demo}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.11.10
+    environment:
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_MAX_LOADED_MODELS: 2
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  models:
+    image: ollama/ollama:0.11.10
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      CHAT_MODEL: ${CHAT_MODEL:-qwen3:4b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ['ollama pull "$$CHAT_MODEL" && ollama pull "$$EMBEDDING_MODEL"']
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  index:
+    <<: *app
+    command: ["python", "app.py", "index"]
+    depends_on:
+      db:
+        condition: service_healthy
+      models:
+        condition: service_completed_successfully
+    restart: "no"
+
+  bot:
+    <<: *app
+    environment:
+      <<: *settings
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
+    depends_on:
+      index:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  eval:
+    <<: *app
+    profiles: ["tools"]
+    command: ["python", "app.py", "evaluate", "--output", "/app/reports/crash-test.json"]
+    volumes:
+      - reports:/app/reports
+    depends_on:
+      index:
+        condition: service_completed_successfully
+    restart: "no"
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: tests
+    init: true
+
+  test-db:
+    profiles: ["test"]
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: shop_test
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: integration_only
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  integration-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: tests
+    init: true
+    environment:
+      TEST_DATABASE_URL: postgresql://shop:integration_only@test-db:5432/shop_test
+    command: ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_postgres.py", "-v"]
+    depends_on:
+      test-db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  ollama_data:
+  reports:
